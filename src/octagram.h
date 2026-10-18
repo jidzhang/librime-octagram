@@ -5,6 +5,7 @@
 #include <rime/component.h>
 #include <rime/resource.h>
 #include <rime/gear/grammar.h>
+#include <unordered_map>
 
 namespace rime {
 
@@ -23,10 +24,19 @@ class Octagram : public Grammar {
   double Query(const string& context,
                const string& word,
                bool is_rear) override;
+  bool is_loaded() const override;
 
  private:
+  // 口语 bigram 增强：grammar/bigram_tsv 配置后启用，
+  // Query 取 .gram 与 bigram 两源的最大分（书面+口语互补）。
+  double QueryBigram(const string& context, const string& word);
+  void LoadBigram(const path& tsv_path);
+
   the<GrammarConfig> config_;
   GramDb* db_ = nullptr;
+  bool bigram_enabled_ = false;
+  double bigram_penalty_ = -4.0;
+  std::unordered_map<string, vector<pair<string, int>>> bigram_;
 };
 
 class OctagramComponent : public Grammar::Component {

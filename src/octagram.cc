@@ -2,6 +2,8 @@
 #include "gram_encoding.h"
 #include "octagram.h"
 #include <algorithm>
+#include <cmath>
+#include <fstream>
 #include <rime/config.h>
 #include <rime/resource.h>
 #include <rime/service.h>
@@ -46,9 +48,24 @@ Octagram::Octagram(Config* config, OctagramComponent* component)
   if (!language.empty()) {
     db_ = component->GetDb(language);
   }
+  string bigram_name;
+  if (config && config->GetString("grammar/bigram_tsv", &bigram_name) &&
+      !bigram_name.empty()) {
+    const ResourceType kBigramType = {"bigram", "", ".tsv"};
+    the<ResourceResolver> resolver(
+        Service::instance().CreateResourceResolver(kBigramType));
+    LoadBigram(resolver->ResolvePath(bigram_name));
+    bigram_enabled_ = !bigram_.empty();
+    config->GetDouble("grammar/bigram_penalty", &bigram_penalty_);
+    if (bigram_enabled_) {
+      DLOG(INFO) << "bigram augmentation enabled: " << bigram_name;
+    }
+  }
 }
 
 Octagram::~Octagram() {}
+
+bool Octagram::is_loaded() const { return db_ != nullptr || bigram_enabled_; }
 
 inline static double scale_value(int value) {
   return value >= 0 ? double(value) / GramDb::kValueScale : -1;
@@ -111,6 +128,7 @@ double Octagram::Query(const string& context,
     return config_->non_collocation_penalty;
   }
   double result = config_->non_collocation_penalty;
+  bool gram_hit = false;
   GramDb::Match matches[GramDb::kMaxResults];
   int n = (std::min)(grammar::kMaxEncodedUnicode,
                      config_->collocation_max_length - 1);
@@ -126,6 +144,9 @@ double Octagram::Query(const string& context,
        context_len > 0;
        --context_len, context_ptr = grammar::next_unicode(context_ptr)) {
     int num_results = db_->Lookup(context_ptr, word_query, matches);
+    if (num_results > 0) {
+      gram_hit = true;
+    }
     DLOG(INFO) << "Lookup(" << context_ptr << " + " << word_query << ") returns "
                << num_results << " results";
     for (auto i = 0; i < num_results; ++i) {
@@ -156,9 +177,109 @@ double Octagram::Query(const string& context,
       DLOG(INFO) << "update: " << word << "$ / " << result;
     }
   }
+  // 门控：essay 无覆盖时才用口语 bigram（独立罚分，可配置放大）。
+  DLOG(INFO) << "query gate: ctx=" << context << " word=" << word
+             << " gram_hit=" << gram_hit << " bg_on=" << bigram_enabled_
+             << " result=" << result;
+  if (bigram_enabled_ && !gram_hit) {
+    double bg = QueryBigram(context, word);
+    if (bg > result) {
+      result = bg;
+    }
+  }
   DLOG(INFO) << "context = " << context << ", word = " << word
              << " / " << result;
   return result;
+}
+
+namespace {
+// 原始 UTF-8 单个字符的字节长度（context 是明文，不经过 gram 键编码）。
+inline size_t raw_utf8_char_len(unsigned char b) {
+  if (b < 0x80) return 1;
+  if ((b & 0xE0) == 0xC0) return 2;
+  if ((b & 0xF0) == 0xE0) return 3;
+  if ((b & 0xF8) == 0xF0) return 4;
+  return 1;
+}
+}  // namespace
+
+double Octagram::QueryBigram(const string& context, const string& word) {
+  if (context.empty()) {
+    return config_->non_collocation_penalty;
+  }
+  // 上下文末尾 ≤4 字，最长后缀优先。用原始 UTF-8 字符边界收集
+  // 最近 5 个起点，取其中最近 ≤4 个作为后缀起点。
+  size_t ring[5];
+  int rc = 0;
+  for (size_t i = 0; i < context.size(); ) {
+    ring[rc % 5] = i;
+    ++rc;
+    i += raw_utf8_char_len(static_cast<unsigned char>(context[i]));
+    if (i > context.size()) {
+      break;  // 容错：截断的多字节序列按已收集的边界处理
+    }
+  }
+  int total = rc;
+  int k = total < 4 ? total : 4;
+  for (int idx = 0; idx < k; ++idx) {
+    int slot = (rc - 1 - idx) % 5;
+    size_t start = ring[slot];
+    auto it = bigram_.find(context.substr(start));
+    if (it == bigram_.end()) {
+      continue;
+    }
+    for (const auto& kw : it->second) {
+      if (kw.first == word) {
+        // 独立罚分（默认 -4）：口语对典型 ln(count)≈9-11，净分 +5~7，
+        // 足以翻转"紧凑词碾压虚词组合"的排序。
+        double score = std::log(static_cast<double>(kw.second)) + bigram_penalty_;
+        DLOG(INFO) << "bigram hit: " << context << " + " << word
+                   << " count=" << kw.second << " score=" << score;
+        return score;
+      }
+    }
+    break;  // 只用最长命中头
+  }
+  return config_->non_collocation_penalty;
+}
+
+void Octagram::LoadBigram(const path& tsv_path) {
+  std::ifstream fin(tsv_path.string());
+  if (!fin) {
+    LOG(ERROR) << "bigram tsv not found: " << tsv_path.string();
+    return;
+  }
+  string line;
+  while (std::getline(fin, line)) {
+    if (line.compare(0, 2, "n	") != 0) {
+      continue;
+    }
+    size_t t1 = line.find('	', 2);
+    if (t1 == string::npos) {
+      continue;
+    }
+    string head = line.substr(2, t1 - 2);
+    auto& row = bigram_[head];
+    size_t pos = t1 + 1;
+    while (pos < line.size()) {
+      size_t sep = line.find(' ', pos);
+      if (sep == string::npos) {
+        sep = line.size();
+      }
+      size_t colon = line.rfind(':', sep);
+      if (colon != string::npos && colon >= pos) {
+        int count = atoi(line.substr(colon + 1, sep - colon - 1).c_str());
+        if (count > 0) {
+          string word = line.substr(pos, colon - pos);
+          if (!word.empty()) {
+            row.push_back({word, count});
+          }
+        }
+      }
+      pos = sep + 1;
+    }
+  }
+  DLOG(INFO) << "bigram heads loaded: " << bigram_.size();
 }
 
 OctagramComponent::OctagramComponent() {}
