@@ -2,14 +2,42 @@
 #include "gram_encoding.h"
 #include "octagram.h"
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <rime/config.h>
 #include <rime/resource.h>
 #include <rime/service.h>
+#include <rime_api.h>
 #include <utf8.h>
 
 namespace rime {
+
+// 运行时罚分覆盖：NaN 表示未启用（用方案配置值）。罚分校准器/设置在引擎
+// 运行期调整 penalty，无需重部署或重初始化引擎。全局单值——同一时刻只有
+// 一个 grammar 方案在提供服务（2026-10-25 moqi 校准设计）。
+static std::atomic<double> g_non_collocation_penalty_override{std::nan("")};
+
+}  // namespace rime
+
+// 插件编译单元没有 RIME_EXPORTS（dllexport 只属于 rime 主目标），这里显式导出。
+#if defined(_WIN32)
+#define MOQI_PLUGIN_EXPORT extern "C" __declspec(dllexport)
+#else
+#define MOQI_PLUGIN_EXPORT RIME_API
+#endif
+MOQI_PLUGIN_EXPORT void RimeSetGrammarNonCollocationPenalty(double value) {
+  rime::g_non_collocation_penalty_override.store(value,
+                                                 std::memory_order_relaxed);
+}
+
+namespace rime {
+
+inline static double effective_non_collocation_penalty(double config_value) {
+  const double override_value =
+      g_non_collocation_penalty_override.load(std::memory_order_relaxed);
+  return std::isnan(override_value) ? config_value : override_value;
+}
 
 struct GrammarConfig {
   int collocation_max_length = 4;
@@ -125,9 +153,9 @@ double Octagram::Query(const string& context,
                        const string& word,
                        bool is_rear) {
   if (!db_ || context.empty()) {
-    return config_->non_collocation_penalty;
+    return effective_non_collocation_penalty(config_->non_collocation_penalty);
   }
-  double result = config_->non_collocation_penalty;
+  double result = effective_non_collocation_penalty(config_->non_collocation_penalty);
   bool gram_hit = false;
   GramDb::Match matches[GramDb::kMaxResults];
   int n = (std::min)(grammar::kMaxEncodedUnicode,
@@ -205,7 +233,7 @@ inline size_t raw_utf8_char_len(unsigned char b) {
 
 double Octagram::QueryBigram(const string& context, const string& word) {
   if (context.empty()) {
-    return config_->non_collocation_penalty;
+    return effective_non_collocation_penalty(config_->non_collocation_penalty);
   }
   // 上下文末尾 ≤4 字，最长后缀优先。用原始 UTF-8 字符边界收集
   // 最近 5 个起点，取其中最近 ≤4 个作为后缀起点。
@@ -240,7 +268,7 @@ double Octagram::QueryBigram(const string& context, const string& word) {
     }
     break;  // 只用最长命中头
   }
-  return config_->non_collocation_penalty;
+  return effective_non_collocation_penalty(config_->non_collocation_penalty);
 }
 
 void Octagram::LoadBigram(const path& tsv_path) {
